@@ -1,0 +1,9 @@
+{
+  "port": 8818,
+  "base_address": "192.168.1.50",
+  "api_key": "your_api_key",
+  "output": "~/scans",
+  "transcribe": true,
+  "model": "gemini-3.5-flash",
+  "instructions": "Output Markdown. Preserve the original language of the note (it may be mixed). Render checkboxes as - [ ] / - [x]."
+}

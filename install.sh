@@ -1,0 +1,1 @@
+cp vflat /usr/local/bin/vflat

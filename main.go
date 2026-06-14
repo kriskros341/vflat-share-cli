@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -22,17 +23,34 @@ import (
 
 // Config holds the resolved runtime settings.
 type Config struct {
-	Port        int
-	BaseAddress string
-	APIKey      string
-	Output      string
-	Transcribe  bool
-	Model       string
+	Port         int
+	BaseAddress  string
+	APIKey       string
+	Output       string
+	Transcribe   bool
+	Model        string
+	Instructions string
+}
+
+// fileConfig mirrors Config for JSON config files. Pointers let us tell an
+// omitted key apart from a zero value, so absent keys don't clobber other
+// sources.
+type fileConfig struct {
+	Port         *int    `json:"port"`
+	BaseAddress  *string `json:"base_address"`
+	APIKey       *string `json:"api_key"`
+	Output       *string `json:"output"`
+	Transcribe   *bool   `json:"transcribe"`
+	Model        *string `json:"model"`
+	Instructions *string `json:"instructions"`
 }
 
 const defaultModel = "gemini-3.5-flash"
 
-func parseConfig() Config {
+// userConfigSubdir names this app's directory under the OS config root.
+const userConfigSubdir = "vflat"
+
+func parseConfig() (Config, error) {
 	// Populate process env from .env files (cwd first, then next to the binary).
 	// Real environment variables always win — loadEnvFile never overrides them.
 	loadEnvFile(".env")
@@ -40,15 +58,21 @@ func parseConfig() Config {
 		loadEnvFile(filepath.Join(filepath.Dir(dir), ".env"))
 	}
 
-	port := flag.Int("port", atoiDefault(os.Getenv("PORT"), 8818),
-		"vFlat server port (env: PORT)")
-	base := flag.String("base-address", os.Getenv("BASE_ADDRESS"),
-		"vFlat server IP/host (env: BASE_ADDRESS)")
-	apiKey := flag.String("api-key", os.Getenv("GEMINI_API_KEY"),
-		"Gemini API key for transcription (env: GEMINI_API_KEY)")
+	// Flags carry only built-in defaults; env, config files, and the per-user
+	// config are layered in explicitly below so each source keeps its own rung
+	// in the precedence ladder.
+	port := flag.Int("port", 8818, "vFlat server port (env: PORT)")
+	base := flag.String("base-address", "", "vFlat server IP/host (env: BASE_ADDRESS)")
+	apiKey := flag.String("api-key", "", "Gemini API key for transcription (env: GEMINI_API_KEY)")
 	model := flag.String("model", defaultModel, "Gemini model used for transcription")
 	transcribe := flag.Bool("transcribe", false,
 		"After downloading, transcribe the images into .txt files")
+	instructions := flag.String("instructions", "",
+		"Extra instructions appended to the Gemini transcription prompt")
+	configPath := flag.String("config", os.Getenv("VFLAT_CONFIG"),
+		"Path to a JSON config file (env: VFLAT_CONFIG)")
+	printConfig := flag.Bool("print-config", false,
+		"Print the resolved configuration and exit")
 
 	var output string
 	flag.StringVar(&output, "output", "", "Destination directory (omitted -> GUI picker)")
@@ -56,14 +80,135 @@ func parseConfig() Config {
 
 	flag.Parse()
 
-	return Config{
-		Port:        *port,
-		BaseAddress: *base,
-		APIKey:      *apiKey,
-		Output:      output,
-		Transcribe:  *transcribe,
-		Model:       *model,
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	// Build the config from the lowest-priority source up. Precedence, low -> high:
+	//   built-in defaults < ~/.vflat.config.json < env / .env < --config file < CLI flags
+	cfg := Config{Port: 8818, Model: defaultModel}
+
+	// 1. Per-user config under the OS config dir (XDG on Linux:
+	// ~/.config/vflat/config.json), the lowest file layer.
+	if dir, err := os.UserConfigDir(); err == nil {
+		userPath := filepath.Join(dir, userConfigSubdir, "config.json")
+		if _, statErr := os.Stat(userPath); statErr == nil {
+			fc, err := loadFileConfig(userPath)
+			if err != nil {
+				return Config{}, err
+			}
+			applyFileConfig(&cfg, fc)
+		}
 	}
+
+	// 2. Environment / .env (only keys actually present override the user config).
+	if v, ok := os.LookupEnv("PORT"); ok {
+		cfg.Port = atoiDefault(v, cfg.Port)
+	}
+	if v, ok := os.LookupEnv("BASE_ADDRESS"); ok {
+		cfg.BaseAddress = v
+	}
+	if v, ok := os.LookupEnv("GEMINI_API_KEY"); ok {
+		cfg.APIKey = v
+	}
+
+	// 3. Explicit --config file.
+	if *configPath != "" {
+		fc, err := loadFileConfig(*configPath)
+		if err != nil {
+			return Config{}, err
+		}
+		applyFileConfig(&cfg, fc)
+	}
+
+	// 4. Explicit CLI flags (only those actually passed).
+	if set["port"] {
+		cfg.Port = *port
+	}
+	if set["base-address"] {
+		cfg.BaseAddress = *base
+	}
+	if set["api-key"] {
+		cfg.APIKey = *apiKey
+	}
+	if set["model"] {
+		cfg.Model = *model
+	}
+	if set["transcribe"] {
+		cfg.Transcribe = *transcribe
+	}
+	if set["instructions"] {
+		cfg.Instructions = *instructions
+	}
+	if set["output"] || set["o"] {
+		cfg.Output = output
+	}
+
+	if *printConfig {
+		printResolvedConfig(cfg)
+		os.Exit(0)
+	}
+
+	return cfg, nil
+}
+
+// printResolvedConfig writes the effective settings to stdout. The API key is
+// masked so the output is safe to paste when debugging.
+func printResolvedConfig(cfg Config) {
+	apiKey := "(unset)"
+	if cfg.APIKey != "" {
+		apiKey = "(set)"
+	}
+	instructions := cfg.Instructions
+	if instructions == "" {
+		instructions = "(none)"
+	}
+	fmt.Println("Resolved configuration:")
+	fmt.Printf("  port:         %d\n", cfg.Port)
+	fmt.Printf("  base-address: %s\n", cfg.BaseAddress)
+	fmt.Printf("  api-key:      %s\n", apiKey)
+	fmt.Printf("  output:       %s\n", cfg.Output)
+	fmt.Printf("  transcribe:   %t\n", cfg.Transcribe)
+	fmt.Printf("  model:        %s\n", cfg.Model)
+	fmt.Printf("  instructions: %s\n", instructions)
+}
+
+// applyFileConfig overlays the keys present in fc onto cfg, leaving absent
+// (nil) keys untouched.
+func applyFileConfig(cfg *Config, fc fileConfig) {
+	if fc.Port != nil {
+		cfg.Port = *fc.Port
+	}
+	if fc.BaseAddress != nil {
+		cfg.BaseAddress = *fc.BaseAddress
+	}
+	if fc.APIKey != nil {
+		cfg.APIKey = *fc.APIKey
+	}
+	if fc.Output != nil {
+		cfg.Output = *fc.Output
+	}
+	if fc.Transcribe != nil {
+		cfg.Transcribe = *fc.Transcribe
+	}
+	if fc.Model != nil {
+		cfg.Model = *fc.Model
+	}
+	if fc.Instructions != nil {
+		cfg.Instructions = *fc.Instructions
+	}
+}
+
+// loadFileConfig reads and decodes a JSON config file.
+func loadFileConfig(path string) (fileConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fileConfig{}, fmt.Errorf("read config %s: %w", path, err)
+	}
+	var fc fileConfig
+	if err := json.Unmarshal(data, &fc); err != nil {
+		return fileConfig{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	return fc, nil
 }
 
 func run(cfg Config) error {
@@ -103,7 +248,7 @@ func run(cfg Config) error {
 	downloadAll(cfg.BaseAddress, cfg.Port, uuid, files, directory)
 
 	if cfg.Transcribe {
-		transcribeAll(cfg.APIKey, cfg.Model, files, directory)
+		transcribeAll(cfg.APIKey, cfg.Model, cfg.Instructions, files, directory)
 	}
 	return nil
 }
@@ -156,7 +301,12 @@ func atoiDefault(s string, def int) int {
 }
 
 func main() {
-	if err := run(parseConfig()); err != nil {
+	cfg, err := parseConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

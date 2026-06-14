@@ -16,10 +16,18 @@ import (
 
 const geminiURL = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 
-const prompt = "Transcribe the note on this page. Return only the text, without any " +
+const defaultPrompt = "Transcribe the note on this page. Return only the text, without any " +
 	"additional commentary. Try to preserve the formatting where possible - " +
 	"spacing and lines separating the different sections of the note." +
 	"Please keep to the original language of the note (they may be mixed)"
+
+// buildPrompt appends any user-supplied instructions to the default prompt.
+func buildPrompt(instructions string) string {
+	if strings.TrimSpace(instructions) == "" {
+		return defaultPrompt
+	}
+	return defaultPrompt + "\n\nAdditional instructions:\n" + instructions
+}
 
 // Request/response shapes for the Gemini generateContent REST call.
 type inlineData struct {
@@ -48,7 +56,7 @@ type geminiResponse struct {
 	} `json:"candidates"`
 }
 
-func transcribeImage(apiKey, model, imagePath string) (string, error) {
+func transcribeImage(apiKey, model, prompt, imagePath string) (string, error) {
 	imageBytes, err := os.ReadFile(imagePath)
 	if err != nil {
 		return "", err
@@ -91,15 +99,16 @@ func transcribeImage(apiKey, model, imagePath string) (string, error) {
 	return result.Candidates[0].Content.Parts[0].Text, nil
 }
 
-func transcribeAll(apiKey, model string, files []fileInfo, outDir string) {
+func transcribeAll(apiKey, model, instructions string, files []fileInfo, outDir string) {
 	fmt.Printf("Starting transcription of %d files...\n", len(files))
+	prompt := buildPrompt(instructions)
 	var wg sync.WaitGroup
 	for _, fi := range files {
 		wg.Add(1)
 		go func(fi fileInfo) {
 			defer wg.Done()
 			imagePath := filepath.Join(outDir, fi.Filename)
-			text, err := transcribeImage(apiKey, model, imagePath)
+			text, err := transcribeImage(apiKey, model, prompt, imagePath)
 			if err != nil {
 				fmt.Printf("Failed to transcribe %s: %v\n", fi.Filename, err)
 				return
